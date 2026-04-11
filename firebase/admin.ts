@@ -1,13 +1,11 @@
-import {
-  applicationDefault,
-  cert,
-  getApps,
-  initializeApp,
-} from "firebase-admin/app";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
 
-/** PEM from .env: fix Windows quoting, escaped newlines, and stray BOM. */
+/** PEM from .env: Windows quoting, escaped newlines, BOM, CRLF. */
 function normalizePrivateKey(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   let key = raw.trim().replace(/^\uFEFF/, "");
@@ -17,7 +15,11 @@ function normalizePrivateKey(raw: string | undefined): string | undefined {
   ) {
     key = key.slice(1, -1);
   }
-  return key.replace(/\\n/g, "\n").trim();
+  return key
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\\n/g, "\n")
+    .trim();
 }
 
 type ServiceAccountJson = {
@@ -34,13 +36,39 @@ function certFromServiceAccount(sa: ServiceAccountJson) {
   });
 }
 
+function resolveJsonPath(raw: string): string {
+  const trimmed = raw.trim().replace(/^["']|["']$/g, "");
+  return resolve(trimmed);
+}
+
+/** Prefer this on Windows: JSON file keeps private_key newlines intact. */
+function initFromServiceAccountFile(filePath: string) {
+  const abs = resolveJsonPath(filePath);
+  if (!existsSync(abs)) {
+    throw new Error(
+      `Firebase Admin: service account file not found: ${abs}\n` +
+        "Download a new key from Firebase Console → Project settings → Service accounts.",
+    );
+  }
+  const parsed = JSON.parse(readFileSync(abs, "utf8")) as ServiceAccountJson;
+  if (!parsed.private_key || !parsed.client_email || !parsed.project_id) {
+    throw new Error(
+      "Service account JSON must include project_id, client_email, and private_key.",
+    );
+  }
+  initializeApp({ credential: certFromServiceAccount(parsed) });
+}
+
 function initFirebaseAdmin() {
   const apps = getApps();
 
   if (!apps.length) {
-    const gac = process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
-    if (gac) {
-      initializeApp({ credential: applicationDefault() });
+    const pathEnv =
+      process.env.FIREBASE_SERVICE_ACCOUNT_PATH?.trim() ||
+      process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
+
+    if (pathEnv) {
+      initFromServiceAccountFile(pathEnv);
     } else {
       const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
       if (rawJson) {
@@ -70,10 +98,14 @@ function initFirebaseAdmin() {
           !clientEmail
         ) {
           throw new Error(
-            "Firebase Admin: use one of these in .env.local:\n" +
-              "1) GOOGLE_APPLICATION_CREDENTIALS=C:/full/path/to/serviceAccount.json (recommended on Windows)\n" +
-              "2) FIREBASE_SERVICE_ACCOUNT_JSON={...full JSON on one line...}\n" +
-              "3) FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY (one line, \\n for newlines)",
+            "Firebase Admin (fix DECODER error on Windows):\n" +
+              "1) Download service account JSON from Firebase Console → Project settings → Service accounts.\n" +
+              "2) Save it as e.g. prep/serviceAccount.json (do not commit).\n" +
+              "3) In .env.local add ONE of:\n" +
+              "   FIREBASE_SERVICE_ACCOUNT_PATH=./serviceAccount.json\n" +
+              "   or GOOGLE_APPLICATION_CREDENTIALS=C:/full/path/to/key.json\n" +
+              "4) Remove broken FIREBASE_PRIVATE_KEY lines.\n" +
+              "Optional: FIREBASE_SERVICE_ACCOUNT_JSON={...single-line JSON...}",
           );
         }
 
