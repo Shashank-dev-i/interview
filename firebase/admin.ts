@@ -1,25 +1,50 @@
+import { createPrivateKey } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
 
-/** PEM from .env: Windows quoting, escaped newlines, BOM, CRLF. */
-function normalizePrivateKey(raw: string | undefined): string | undefined {
-  if (!raw) return undefined;
-  let key = raw.trim().replace(/^\uFEFF/, "");
-  if (
-    (key.startsWith('"') && key.endsWith('"')) ||
-    (key.startsWith("'") && key.endsWith("'"))
-  ) {
-    key = key.slice(1, -1);
-  }
-  return key
+/**
+ * Re-encode PEM so OpenSSL / google-auth can sign JWTs.
+ * Fixes many Windows/.env mangling cases and surfaces a clear error if the key is garbage.
+ */
+function coercePrivateKeyPem(raw: string): string {
+  let pem = raw
+    .trim()
+    .replace(/^\uFEFF/, "")
     .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .replace(/\\n/g, "\n")
-    .trim();
+    .replace(/\r/g, "\n");
+
+  if (
+    (pem.startsWith('"') && pem.endsWith('"')) ||
+    (pem.startsWith("'") && pem.endsWith("'"))
+  ) {
+    pem = pem.slice(1, -1).replace(/\\n/g, "\n");
+  } else if (!pem.includes("BEGIN ") && pem.includes("\\n")) {
+    pem = pem.replace(/\\n/g, "\n");
+  }
+
+  try {
+    const key = createPrivateKey({ key: pem, format: "pem" });
+    return key.export({ format: "pem", type: "pkcs8" }) as string;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `Firebase Admin private key is invalid (Node crypto: ${msg}). ` +
+        "Fix: set FIREBASE_SERVICE_ACCOUNT_PATH to the JSON file from Firebase Console " +
+        "(Project settings → Service accounts → Generate new private key), " +
+        "or paste the full JSON into FIREBASE_SERVICE_ACCOUNT_JSON. " +
+        "Avoid FIREBASE_PRIVATE_KEY on Windows unless you are sure the PEM is perfect.",
+    );
+  }
+}
+
+/** PEM from .env only (before crypto coercion). */
+function normalizePrivateKeyFromEnv(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  return coercePrivateKeyPem(raw);
 }
 
 type ServiceAccountJson = {
@@ -29,25 +54,30 @@ type ServiceAccountJson = {
 };
 
 function certFromServiceAccount(sa: ServiceAccountJson) {
+  const privateKey = coercePrivateKeyPem(sa.private_key);
   return cert({
     projectId: sa.project_id,
     clientEmail: sa.client_email,
-    privateKey: sa.private_key,
+    privateKey,
   });
 }
 
-function resolveJsonPath(raw: string): string {
+function resolveCredentialFilePath(raw: string): string {
   const trimmed = raw.trim().replace(/^["']|["']$/g, "");
-  return resolve(trimmed);
+  if (isAbsolute(trimmed)) return resolve(trimmed);
+  return resolve(process.cwd(), trimmed);
 }
 
-/** Prefer this on Windows: JSON file keeps private_key newlines intact. */
+/**
+ * Use ONLY FIREBASE_SERVICE_ACCOUNT_PATH (not GOOGLE_APPLICATION_CREDENTIALS) so a broken
+ * system-wide GAC on Windows does not override your .env.local.
+ */
 function initFromServiceAccountFile(filePath: string) {
-  const abs = resolveJsonPath(filePath);
+  const abs = resolveCredentialFilePath(filePath);
   if (!existsSync(abs)) {
     throw new Error(
-      `Firebase Admin: service account file not found: ${abs}\n` +
-        "Download a new key from Firebase Console → Project settings → Service accounts.",
+      `FIREBASE_SERVICE_ACCOUNT_PATH file not found: ${abs}\n` +
+        "(path is resolved from the project directory where you run next dev)",
     );
   }
   const parsed = JSON.parse(readFileSync(abs, "utf8")) as ServiceAccountJson;
@@ -63,12 +93,10 @@ function initFirebaseAdmin() {
   const apps = getApps();
 
   if (!apps.length) {
-    const pathEnv =
-      process.env.FIREBASE_SERVICE_ACCOUNT_PATH?.trim() ||
-      process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
+    const filePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH?.trim();
 
-    if (pathEnv) {
-      initFromServiceAccountFile(pathEnv);
+    if (filePath) {
+      initFromServiceAccountFile(filePath);
     } else {
       const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
       if (rawJson) {
@@ -87,7 +115,9 @@ function initFirebaseAdmin() {
         }
         initializeApp({ credential: certFromServiceAccount(parsed) });
       } else {
-        const privateKey = normalizePrivateKey(process.env.FIREBASE_PRIVATE_KEY);
+        const privateKey = normalizePrivateKeyFromEnv(
+          process.env.FIREBASE_PRIVATE_KEY,
+        );
         const projectId = process.env.FIREBASE_PROJECT_ID?.trim();
         const clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim();
 
@@ -98,14 +128,10 @@ function initFirebaseAdmin() {
           !clientEmail
         ) {
           throw new Error(
-            "Firebase Admin (fix DECODER error on Windows):\n" +
-              "1) Download service account JSON from Firebase Console → Project settings → Service accounts.\n" +
-              "2) Save it as e.g. prep/serviceAccount.json (do not commit).\n" +
-              "3) In .env.local add ONE of:\n" +
-              "   FIREBASE_SERVICE_ACCOUNT_PATH=./serviceAccount.json\n" +
-              "   or GOOGLE_APPLICATION_CREDENTIALS=C:/full/path/to/key.json\n" +
-              "4) Remove broken FIREBASE_PRIVATE_KEY lines.\n" +
-              "Optional: FIREBASE_SERVICE_ACCOUNT_JSON={...single-line JSON...}",
+            "Firebase Admin: set FIREBASE_SERVICE_ACCOUNT_PATH=./your-key.json in .env.local\n" +
+              "(download JSON from Firebase → Project settings → Service accounts).\n" +
+              "Do not rely on GOOGLE_APPLICATION_CREDENTIALS for this app — a wrong system env breaks sign-in.\n" +
+              "Alternative: FIREBASE_SERVICE_ACCOUNT_JSON={...one line...}",
           );
         }
 
