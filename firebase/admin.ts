@@ -98,9 +98,23 @@ function initFirebaseAdmin() {
     const filePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH?.trim();
     const base64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64?.trim();
     const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+    const rawPem = process.env.FIREBASE_PRIVATE_KEY;
+    const projectId = process.env.FIREBASE_PROJECT_ID?.trim();
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim();
 
     if (filePath) {
-      initFromServiceAccountFile(filePath);
+      const abs = resolveCredentialFilePath(filePath);
+      if (existsSync(abs)) {
+        initFromServiceAccountFile(filePath);
+      } else if (!base64 && !rawJson && (!rawPem?.trim() || !projectId || !clientEmail)) {
+        throw new Error(
+          `FIREBASE_SERVICE_ACCOUNT_PATH file not found: ${abs}\n` +
+            "Set one of these env vars in your deploy environment:\n" +
+            "  FIREBASE_SERVICE_ACCOUNT_BASE64=<base64 of full JSON>\n" +
+            "  FIREBASE_SERVICE_ACCOUNT_JSON={...}\n" +
+            "  OR FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL + FIREBASE_PROJECT_ID",
+        );
+      }
     } else if (base64) {
       let jsonText: string;
       try {
@@ -126,10 +140,6 @@ function initFirebaseAdmin() {
       }
       initializeApp({ credential: certFromServiceAccount(parsed) });
     } else {
-      const rawPem = process.env.FIREBASE_PRIVATE_KEY;
-      const projectId = process.env.FIREBASE_PROJECT_ID?.trim();
-      const clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim();
-
       if (!rawPem?.trim() || !projectId || !clientEmail) {
         throw new Error(
           "Firebase Admin: add to .env.local one of:\n" +
