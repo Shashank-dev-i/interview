@@ -3,6 +3,7 @@
 import Image from "next/image";
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
 import { vapi } from "@/lib/vapi.sdk";
@@ -19,6 +20,35 @@ enum CallStatus {
 interface SavedMessage {
   role: "user" | "system" | "assistant";
   content: string;
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (!error || typeof error !== "object") return "Unknown error";
+
+  const maybe = error as {
+    message?: unknown;
+    error?: { message?: unknown };
+  };
+
+  if (typeof maybe.message === "string") return maybe.message;
+  if (
+    maybe.message &&
+    typeof maybe.message === "object" &&
+    "message" in maybe.message &&
+    typeof (maybe.message as { message?: unknown }).message === "string"
+  ) {
+    return (maybe.message as { message: string }).message;
+  }
+  if (maybe.error && typeof maybe.error.message === "string") {
+    return maybe.error.message;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return "Unknown error";
+  }
 }
 
 const Agent = ({
@@ -61,8 +91,12 @@ const Agent = ({
       setIsSpeaking(false);
     };
 
-    const onError = (error: Error) => {
-      console.log("Error:", error);
+    const onError = (error: unknown) => {
+      console.log("Vapi error:", error);
+      toast.error("Interview could not start", {
+        description: getErrorMessage(error),
+      });
+      setCallStatus(CallStatus.INACTIVE);
     };
 
     vapi.on("call-start", onCallStart);
@@ -118,37 +152,15 @@ const Agent = ({
     setCallStatus(CallStatus.CONNECTING);
 
     try {
-      if (type === "generate") {
-        const workflowId = process.env.NEXT_PUBLIC_VAPI_WORKFLOW_ID;
-        if (!workflowId?.trim()) {
-          console.error(
-            "Missing NEXT_PUBLIC_VAPI_WORKFLOW_ID. Add it to .env.local (see README)."
-          );
-          setCallStatus(CallStatus.INACTIVE);
-          return;
-        }
-      
-        await vapi.start(undefined, undefined, undefined, workflowId, {
-          variableValues: {
-            username: userName,
-            userid: userId,
-          },
-        });
-      } else {
-        let formattedQuestions = "";
-        if (questions) {
-          formattedQuestions = questions
-            .map((question) => `- ${question}`)
-            .join("\n");
-        }
-
-        await vapi.start(interviewer, {
-          variableValues: {
-            questions: formattedQuestions,
-          },
-        });
+      const assistantId = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID?.trim();
+      if (!assistantId) {
+        throw new Error("Missing NEXT_PUBLIC_VAPI_ASSISTANT_ID.");
       }
-    } catch {
+      await vapi.start(assistantId);
+    } catch (error) {
+      console.error("Failed to start Vapi call:", error);
+      const message = getErrorMessage(error);
+      toast.error("Interview could not start", { description: message });
       setCallStatus(CallStatus.INACTIVE);
     }
   };
