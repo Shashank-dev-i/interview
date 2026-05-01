@@ -234,7 +234,7 @@ const Agent = ({
             </span>
           </button>
         ) : (
-          <button className="btn-disconnect" onClick={() => handleDisconnect()}>
+          <button className="btn-disconnect" onClick={() => handleDisconnect()}> 
             End
           </button>
         )}
